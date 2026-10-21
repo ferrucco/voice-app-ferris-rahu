@@ -1,0 +1,6 @@
+{
+  "name": "Ferru — Ferris Rahu Voice Ambassador",
+  "description": "Minimalist and sophisticated bilingual voice assistant representing Ferris Rahu, built with Gemini Live API.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
