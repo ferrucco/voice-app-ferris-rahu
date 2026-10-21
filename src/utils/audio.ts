@@ -124,13 +124,27 @@ export class LiveAudioPlayer {
   }
 }
 
-// Convert base64 WAV into playable Blob object URL
-export function base64WavToUrl(base64: string): string {
+// Gemini TTS may return raw 24 kHz, mono, 16-bit PCM. Audio elements
+// require a WAV container; a Blob with a WAV MIME type alone is not enough.
+export function base64WavToUrl(base64: string, mimeType?: string): string {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
+  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+  const type=(mimeType||'').toLowerCase();
+  const looksLikeWav=bytes.length>=12 &&
+    String.fromCharCode(...bytes.slice(0,4))==='RIFF' &&
+    String.fromCharCode(...bytes.slice(8,12))==='WAVE';
+  if(looksLikeWav || type.includes('audio/wav') || type.includes('audio/x-wav')){
+    return URL.createObjectURL(new Blob([bytes],{type:'audio/wav'}));
   }
-  const blob = new Blob([bytes], { type: 'audio/wav' });
-  return URL.createObjectURL(blob);
+  const rate=Number(type.match(/rate=(\\d+)/)?.[1]||24000);
+  const header=new ArrayBuffer(44);
+  const view=new DataView(header);
+  const label=(offset:number,str:string)=>{for(let i=0;i<str.length;i++)view.setUint8(offset+i,str.charCodeAt(i));};
+  label(0,'RIFF');view.setUint32(4,36+bytes.length,true);label(8,'WAVE');
+  label(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);
+  view.setUint16(22,1,true);view.setUint32(24,rate,true);
+  view.setUint32(28,rate*2,true);view.setUint16(32,2,true);view.setUint16(34,16,true);
+  label(36,'data');view.setUint32(40,bytes.length,true);
+  return URL.createObjectURL(new Blob([header,bytes],{type:'audio/wav'}));
 }
