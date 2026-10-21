@@ -137,7 +137,7 @@ export function base64WavToUrl(base64: string, mimeType?: string): string {
   if(looksLikeWav || type.includes('audio/wav') || type.includes('audio/x-wav')){
     return URL.createObjectURL(new Blob([bytes],{type:'audio/wav'}));
   }
-  const rate=Number(type.match(/rate=(\\d+)/)?.[1]||24000);
+  const rate=Number(type.match(/rate=(\d+)/)?.[1]||24000);
   const header=new ArrayBuffer(44);
   const view=new DataView(header);
   const label=(offset:number,str:string)=>{for(let i=0;i<str.length;i++)view.setUint8(offset+i,str.charCodeAt(i));};
