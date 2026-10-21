@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { GoogleGenAI, Modality } from '@google/genai';
 import {
   Mic,
   MicOff,
@@ -60,7 +61,7 @@ export const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
   const [audioLevel, setAudioLevel] = useState<number>(10);
 
   // References for Live WebSocket and Audio
-  const liveWsRef = useRef<WebSocket | null>(null);
+  const liveSessionRef = useRef<any>(null);
   const audioPlayerRef = useRef<LiveAudioPlayer | null>(null);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -146,136 +147,99 @@ export const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
     return () => cancelAnimationFrame(animId);
   }, [isPlayingAudio, liveStatus]);
 
-  // Start Gemini 3.8 Live API WebSocket session
+  // Vercel-compatible Live API: receive a single-use ephemeral token, then
+  // connect the browser directly to Gemini. Never expose the permanent API key.
   const startLiveSession = async () => {
+    setLiveStatus('connecting');
+    setStatusMessage('Connecting to Ferru voice...');
+    let stream: MediaStream | null = null;
     try {
-      setLiveStatus('connecting');
-      setStatusMessage('Initializing Gemini 3.8 Live link...');
-
-      // Request microphone
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          sampleRate: 16000,
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
+      const tokenResp = await fetch('/api/live/token', {method:'POST',cache:'no-store'});
+      const tokenData = await tokenResp.json().catch(() => ({}));
+      if (!tokenResp.ok || !tokenData.token) {
+        throw new Error(tokenData.error || 'Gemini voice authorization failed.');
+      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}
       });
       mediaStreamRef.current = stream;
 
-      // Setup WebSocket
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/live`;
-      const ws = new WebSocket(wsUrl);
-      liveWsRef.current = ws;
+      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+      const inputCtx = new AudioCtxClass({sampleRate:16000});
+      inputAudioCtxRef.current = inputCtx;
+      await inputCtx.resume();
+      const source = inputCtx.createMediaStreamSource(stream);
+      const processor = inputCtx.createScriptProcessor(2048,1,1);
+      scriptProcessorRef.current = processor;
+      source.connect(processor);
+      processor.connect(inputCtx.destination);
 
-      ws.onopen = () => {
-        setIsLiveActive(true);
-        setLiveStatus('connected');
-        setStatusMessage('Live session established. Speak naturally.');
-
-        // Initialize mic audio processing (16kHz PCM)
-        const AudioCtxClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const inputCtx = new AudioCtxClass({ sampleRate: 16000 });
-        inputAudioCtxRef.current = inputCtx;
-
-        const source = inputCtx.createMediaStreamSource(stream);
-        const processor = inputCtx.createScriptProcessor(2048, 1, 1);
-        scriptProcessorRef.current = processor;
-
-        source.connect(processor);
-        processor.connect(inputCtx.destination);
-
-        processor.onaudioprocess = (e) => {
-          if (isMutedRef.current) return;
-          if (ws.readyState === WebSocket.OPEN) {
-            const inputData = e.inputBuffer.getChannelData(0);
-            const base64PCM = floatTo16BitPCMBase64(inputData);
-            ws.send(JSON.stringify({ audio: base64PCM }));
-          }
-        };
-
-        // Send language context
-        const initialGreetingHint = currentLanguage === 'fr'
-          ? "Bonjour Ferru, présente-toi brièvement en français avec ta voix grave."
-          : "Hello Ferru, please introduce yourself briefly in English with your deep baritone voice.";
-        ws.send(JSON.stringify({ text: initialGreetingHint }));
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-
-          if (msg.type === 'status') {
-            if (msg.status === 'connected') {
+      // Gemini Live accepts these short-lived token credentials.
+      const ai = new GoogleGenAI({apiKey:tokenData.token});
+      const session = await ai.live.connect({
+        model: tokenData.model || 'gemini-3.8-live',
+        config:{
+          responseModalities:[Modality.AUDIO],
+          speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:'Fenrir'}}},
+          inputAudioTranscription:{},
+          outputAudioTranscription:{},
+          systemInstruction: "You are Ferru, Ferris Rahu's personal voice assistant for an Estonian Business School prototype. Introduce Ferris' AI projects, education and web work. Don't invent personal information or claim to have contacted Ferris. Keep spoken replies short and natural."
+        },
+        callbacks:{
+          onopen:()=>{setIsLiveActive(true);setLiveStatus('listening');setStatusMessage('Ferru is listening. Speak naturally.');},
+          onmessage:(message:any)=>{
+            const content=message.serverContent;
+            if(!content)return;
+            for(const part of content.modelTurn?.parts || []){
+              if(part.inlineData?.data)audioPlayerRef.current?.playChunk(part.inlineData.data);
+            }
+            const spoken=content.outputTranscription?.text ||
+              (content.modelTurn?.parts || []).map((p:any)=>p.text||'').join('');
+            if(spoken){
+              setMessages(prev=>[...prev,{
+                id:`live-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+                role:'assistant',content:spoken,timestamp:new Date(),language:currentLanguage
+              }]);
+            }
+            if(content.interrupted){
+              audioPlayerRef.current?.stop();
               setLiveStatus('listening');
-              setStatusMessage('Ferru is listening. Speak in English or French.');
+              setStatusMessage('Listening...');
             }
-          }
-
-          if (msg.type === 'audio' && msg.audio) {
-            if (audioPlayerRef.current) {
-              audioPlayerRef.current.playChunk(msg.audio);
-            }
-          }
-
-          if (msg.type === 'interrupted') {
-            if (audioPlayerRef.current) {
-              audioPlayerRef.current.stop();
-            }
-            setLiveStatus('listening');
-            setStatusMessage('Listening...');
-          }
-
-          if (msg.type === 'transcript' && msg.text) {
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              if (last && last.role === 'assistant' && (Date.now() - last.timestamp.getTime() < 8000)) {
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, content: `${last.content} ${msg.text}` },
-                ];
-              } else {
-                return [
-                  ...prev,
-                  {
-                    id: `live-${Date.now()}`,
-                    role: 'assistant',
-                    content: msg.text,
-                    timestamp: new Date(),
-                    language: currentLanguage,
-                  },
-                ];
-              }
-            });
-          }
-
-          if (msg.type === 'error') {
-            console.error('Server Live Error:', msg.error);
-            setStatusMessage(msg.error || 'Live link notification');
-          }
-        } catch (err) {
-          console.error('Error handling WebSocket message:', err);
+          },
+          onerror:(error:any)=>{
+            console.error('Gemini Live failure',error);
+            setLiveStatus('error');
+            setIsLiveActive(false);
+            setStatusMessage('Live session ended. Check Gemini model access and retry.');
+          },
+          onclose:()=>{setIsLiveActive(false);setLiveStatus('idle');setStatusMessage('Live session ended.');}
         }
+      });
+      liveSessionRef.current=session;
+      setIsLiveActive(true);
+      setLiveStatus('listening');
+      setStatusMessage('Ferru is listening. Speak naturally.');
+      processor.onaudioprocess=(event)=>{
+        if(isMutedRef.current || !liveSessionRef.current)return;
+        try {
+          liveSessionRef.current.sendRealtimeInput({
+            audio:{data:floatTo16BitPCMBase64(event.inputBuffer.getChannelData(0)),mimeType:'audio/pcm;rate=16000'}
+          });
+        } catch (error) { console.error('Live microphone stream ended',error); }
       };
-
-      ws.onerror = (err) => {
-        console.error('WebSocket connection error:', err);
-        setLiveStatus('error');
-        setStatusMessage('Live audio connection failed. Switching to conversational mode.');
-      };
-
-      ws.onclose = () => {
-        setIsLiveActive(false);
-        setLiveStatus('idle');
-        setStatusMessage('Live voice session concluded');
-        cleanupAudioNodes();
-      };
-    } catch (micErr: unknown) {
-      console.error('Microphone access error:', micErr);
-      setLiveStatus('error');
-      setStatusMessage('Microphone access denied or unavailable. You can still use interactive voice queries below.');
+      const prompt=currentLanguage==='fr'
+        ? "Présente-toi en français très brièvement, comme l'assistant vocal de Ferris Rahu."
+        : "Introduce yourself briefly in English as Ferris Rahu's AI voice assistant.";
+      session.sendRealtimeInput({text:prompt});
+    }catch(error:any){
+      console.error('Ferru voice start error',error);
       setIsLiveActive(false);
+      setLiveStatus('error');
+      setStatusMessage(error?.name==='NotAllowedError'
+        ? 'Microphone permission denied. Allow microphone access in your browser.'
+        : `Voice connection failed: ${error?.message || 'Please retry'}`);
+      cleanupAudioNodes();
     }
   };
 
@@ -298,9 +262,9 @@ export const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
   };
 
   const stopLiveSession = () => {
-    if (liveWsRef.current) {
-      liveWsRef.current.close();
-      liveWsRef.current = null;
+    if (liveSessionRef.current) {
+      try { liveSessionRef.current.close(); } catch {}
+      liveSessionRef.current = null;
     }
     cleanupAudioNodes();
     setIsLiveActive(false);
@@ -352,7 +316,7 @@ export const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
 
       let audioUrl: string | undefined = undefined;
       if (data.audio) {
-        audioUrl = base64WavToUrl(data.audio);
+        audioUrl = base64WavToUrl(data.audio, data.mimeType);
       }
 
       const assistantMsg: Message = {
